@@ -1,0 +1,504 @@
+openapi: 3.0.3
+info:
+  title: Unemployment Claims API
+  description: |
+    REST API for the modernized unemployment claims system.
+    Replaces COBOL SYSIN batch command interface (UNEMPCLM.cbl + GETCLAIM.cbl)
+    with a standards-compliant HTTP API secured by Cognito JWT tokens.
+  version: 1.0.0
+  contact:
+    name: Claims Modernization Team
+
+servers:
+  - url: https://{api-id}.execute-api.us-east-1.amazonaws.com/dev
+    description: Development
+  - url: https://{api-id}.execute-api.us-east-1.amazonaws.com/prod
+    description: Production
+
+security:
+  - CognitoAuth: []
+
+paths:
+  /claims:
+    get:
+      summary: List claims (range query)
+      description: |
+        Sequential range scan starting at a period key.
+        Replaces COBOL: GETCLAIM Read with num_records > 1.
+        No longer limited to 200 records per request.
+      operationId: listClaims
+      parameters:
+        - name: start
+          in: query
+          description: Starting period key (MMDDYYYY format)
+          schema:
+            type: string
+            pattern: ^(0[1-9]|1[0-2])01(19|20)\d{2}$
+            example: "01012017"
+        - name: count
+          in: query
+          description: Number of periods to return (max 1000)
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 10
+        - name: category
+          in: query
+          description: Filter to a single demographic category
+          schema:
+            type: string
+            enum: [age, ethnicity, industry, race, gender]
+      responses:
+        "200":
+          description: List of claim periods
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClaimListResponse"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+    post:
+      summary: Create a new claim period
+      description: |
+        Insert a new filing period record with demographic counts.
+        Replaces COBOL: GETCLAIM Insert (I) command.
+        Includes R07 read-back confirmation and R15 cross-totals validation.
+      operationId: createClaim
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ClaimCreateRequest"
+      responses:
+        "201":
+          description: Claim created successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClaimCreateResponse"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "409":
+          description: Duplicate record (R09)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /claims/{period_key}:
+    parameters:
+      - name: period_key
+        in: path
+        required: true
+        description: 8-character period identifier in MMDDYYYY format (DD always 01)
+        schema:
+          type: string
+          pattern: ^(0[1-9]|1[0-2])01(19|20)\d{2}$
+          example: "01012017"
+
+    get:
+      summary: Get a single claim period
+      description: |
+        Direct keyed lookup by period identifier.
+        Replaces COBOL: GETCLAIM Read (R) with num_records = 1.
+        Returns all 5 demographic categories (detail/directory view).
+      operationId: getClaimByKey
+      responses:
+        "200":
+          description: Claim period details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClaimDetailResponse"
+        "404":
+          description: Period not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+    put:
+      summary: Update an existing claim period
+      description: |
+        Creates a new version of the record (temporal update).
+        Replaces COBOL: GETCLAIM Update (U) command.
+        Unlike COBOL REWRITE, the previous version is preserved.
+        Includes R08 read-back confirmation.
+      operationId: updateClaim
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ClaimUpdateRequest"
+      responses:
+        "200":
+          description: Claim updated with new version
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClaimUpdateResponse"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "404":
+          description: Period not found (R06)
+
+    delete:
+      summary: Soft-delete a claim period
+      description: |
+        Marks the record as not current. Data is preserved for audit.
+        Replaces COBOL: GETCLAIM Delete (D) command.
+        R05: Record must exist. R12: Data captured before deletion.
+      operationId: deleteClaim
+      responses:
+        "200":
+          description: Claim deleted, returns captured data
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClaimDeleteResponse"
+        "404":
+          description: Period not found (R05)
+
+  /reports/generate:
+    post:
+      summary: Generate a claims report
+      description: |
+        Generates demographic reports in JSON or text format.
+        Replaces COBOL: UNEMPCLM OUTCLAIM.txt report writer.
+        Returns a pre-signed S3 URL for download.
+      operationId: generateReport
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReportRequest"
+      responses:
+        "200":
+          description: Report generated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReportResponse"
+
+components:
+  securitySchemes:
+    CognitoAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Cognito User Pool JWT token
+
+  responses:
+    ValidationError:
+      description: Request failed validation (R15-R20)
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              errors:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ValidationErrorItem"
+    Unauthorized:
+      description: Missing or invalid JWT token
+
+  schemas:
+    DemographicCounts:
+      type: object
+      description: |
+        All 43 demographic count fields from the COBOL record structure.
+        INTEGER type replaces COBOL PIC X(05) to support values > 99,999.
+      properties:
+        age_ina:
+          type: integer
+          minimum: 0
+          description: Claimants with missing/inapplicable age data
+        age_under_22:
+          type: integer
+          minimum: 0
+        age_22_24:
+          type: integer
+          minimum: 0
+        age_25_34:
+          type: integer
+          minimum: 0
+        age_35_44:
+          type: integer
+          minimum: 0
+        age_45_54:
+          type: integer
+          minimum: 0
+        age_55_59:
+          type: integer
+          minimum: 0
+        age_60_64:
+          type: integer
+          minimum: 0
+        age_65_over:
+          type: integer
+          minimum: 0
+        eth_ina:
+          type: integer
+          minimum: 0
+        eth_hispanic_latino:
+          type: integer
+          minimum: 0
+        eth_not_hispanic_latino:
+          type: integer
+          minimum: 0
+        ind_ina:
+          type: integer
+          minimum: 0
+        ind_wholesale_trade:
+          type: integer
+          minimum: 0
+        ind_transportation:
+          type: integer
+          minimum: 0
+        ind_construction:
+          type: integer
+          minimum: 0
+        ind_finance_insurance:
+          type: integer
+          minimum: 0
+        ind_manufacturing:
+          type: integer
+          minimum: 0
+        ind_agriculture:
+          type: integer
+          minimum: 0
+        ind_public_admin:
+          type: integer
+          minimum: 0
+        ind_utilities:
+          type: integer
+          minimum: 0
+        ind_accommodation_food:
+          type: integer
+          minimum: 0
+        ind_information:
+          type: integer
+          minimum: 0
+        ind_professional_tech:
+          type: integer
+          minimum: 0
+        ind_real_estate:
+          type: integer
+          minimum: 0
+        ind_other_services:
+          type: integer
+          minimum: 0
+        ind_management:
+          type: integer
+          minimum: 0
+        ind_educational:
+          type: integer
+          minimum: 0
+        ind_mining:
+          type: integer
+          minimum: 0
+        ind_health_care:
+          type: integer
+          minimum: 0
+        ind_arts_entertainment:
+          type: integer
+          minimum: 0
+        ind_admin_support:
+          type: integer
+          minimum: 0
+        ind_retail_trade:
+          type: integer
+          minimum: 0
+        race_ina:
+          type: integer
+          minimum: 0
+        race_white:
+          type: integer
+          minimum: 0
+        race_asian:
+          type: integer
+          minimum: 0
+        race_black:
+          type: integer
+          minimum: 0
+        race_native_american:
+          type: integer
+          minimum: 0
+        race_pacific_islander:
+          type: integer
+          minimum: 0
+        gender_ina:
+          type: integer
+          minimum: 0
+        gender_female:
+          type: integer
+          minimum: 0
+        gender_male:
+          type: integer
+          minimum: 0
+
+    ClaimCreateRequest:
+      type: object
+      required: [period_key, counts]
+      properties:
+        period_key:
+          type: string
+          pattern: ^(0[1-9]|1[0-2])01(19|20)\d{2}$
+          description: Filing period in MMDDYYYY format (R16)
+          example: "01012017"
+        region_code:
+          type: string
+          example: "US-NY"
+        counts:
+          $ref: "#/components/schemas/DemographicCounts"
+
+    ClaimCreateResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        period_key:
+          type: string
+        period_date:
+          type: string
+          format: date
+        status:
+          type: string
+          enum: [CREATED]
+        readback_confirmed:
+          type: boolean
+          description: R07 confirmation that inserted data was read back successfully
+
+    ClaimDetailResponse:
+      type: object
+      properties:
+        period_key:
+          type: string
+        period_date:
+          type: string
+          format: date
+        region_code:
+          type: string
+        effective_from:
+          type: string
+          format: date-time
+        demographics:
+          type: object
+          additionalProperties:
+            type: object
+            additionalProperties:
+              type: integer
+
+    ClaimListResponse:
+      type: object
+      properties:
+        count:
+          type: integer
+        records:
+          type: array
+          items:
+            $ref: "#/components/schemas/ClaimDetailResponse"
+
+    ClaimUpdateRequest:
+      type: object
+      required: [counts]
+      properties:
+        counts:
+          $ref: "#/components/schemas/DemographicCounts"
+        region_code:
+          type: string
+
+    ClaimUpdateResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        period_key:
+          type: string
+        status:
+          type: string
+          enum: [UPDATED]
+        previous_version_id:
+          type: string
+          format: uuid
+          description: ID of the superseded version (temporal history)
+        readback_confirmed:
+          type: boolean
+          description: R08 confirmation
+
+    ClaimDeleteResponse:
+      type: object
+      properties:
+        period_key:
+          type: string
+        status:
+          type: string
+          enum: [DELETED]
+        deleted_counts:
+          $ref: "#/components/schemas/DemographicCounts"
+        before_hash:
+          type: string
+          description: SHA-256 hash of deleted data for audit verification
+
+    ReportRequest:
+      type: object
+      properties:
+        start_period:
+          type: string
+          pattern: ^(0[1-9]|1[0-2])01(19|20)\d{2}$
+          example: "01012017"
+        end_period:
+          type: string
+          pattern: ^(0[1-9]|1[0-2])01(19|20)\d{2}$
+          example: "12012017"
+        category:
+          type: string
+          enum: [age, ethnicity, industry, race, gender]
+        format:
+          type: string
+          enum: [json, text]
+          default: json
+
+    ReportResponse:
+      type: object
+      properties:
+        report_key:
+          type: string
+          description: S3 object key
+        download_url:
+          type: string
+          description: Pre-signed S3 URL (valid 1 hour)
+        total_periods:
+          type: integer
+        format:
+          type: string
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+        message:
+          type: string
+
+    ValidationErrorItem:
+      type: object
+      properties:
+        rule:
+          type: string
+          description: Business rule ID (e.g., R15, R16)
+        severity:
+          type: string
+          enum: [ERROR, WARNING]
+        message:
+          type: string

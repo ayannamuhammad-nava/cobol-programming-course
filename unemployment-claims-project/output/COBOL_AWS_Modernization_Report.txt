@@ -1,0 +1,897 @@
+
+
+
+
+COBOL Unemployment Claims System
+AWS Modernization Report
+
+
+Technical Analysis & Cloud Migration Strategy
+
+
+Project: Unemployment Claims Project
+Programs Analyzed: UNEMPCLM.cbl | GETCLAIM.cbl
+Output Reference: OUTCLAIM.txt
+Date: April 2026
+Status: Draft for Review
+
+Table of Contents
+
+(Right-click and select "Update Field" to populate table of contents)
+
+1. High-Level Summary
+This report presents a complete technical and business analysis of a legacy COBOL-based unemployment claims system comprising two programs — UNEMPCLM.cbl and GETCLAIM.cbl — and provides a structured roadmap for migrating the system to AWS. The analysis covers business logic, data model, file formats, identified risks, policy-as-code opportunities, and three modernization options with a recommended migration path.
+System Overview
+UNEMPCLM.cbl — Orchestration and reporting program. Reads batch commands from SYSIN, calls GETCLAIM for data operations, and writes formatted reports to OUTCLAIM (a sequential print file).
+GETCLAIM.cbl — Data access layer. The sole program that interacts with the VSAM CLAIMS database. Performs all CRUD operations (Read, Insert, Update, Delete) and returns results to UNEMPCLM via shared Linkage Section memory.
+CLAIMS (VSAM KSDS) — The underlying database. An IBM mainframe VSAM Key-Sequenced Data Set storing variable-length records (1-260 characters) keyed by an 8-character period identifier in MMDDYYYY format.
+OUTCLAIM.txt — The output report file. A sequential, variable-length formatted print file containing demographic breakdowns of unemployment claims by age, ethnicity, industry, race, and gender.
+Key Statistics
+Metric
+Value
+Total COBOL source lines
+~1,800 (both programs combined)
+Total data fields per record
+43 comma-separated fields + 1 VSAM key
+Demographic categories
+5 (Age, Ethnicity, Industry, Race, Gender)
+Industry sectors tracked
+20
+Age brackets
+8 (<22, 22-24, 25-34, 35-44, 45-54, 55-59, 60-64, 65+)
+Race categories
+5
+CRUD operations supported
+4 (Read, Insert, Update, Delete)
+Max records per request
+200
+Max commands per batch run
+200
+Historical data range (OUTCLAIM.txt)
+2012-2021
+Critical Findings
+6 business rules are completely absent from the codebase and have never been enforced
+The most severe gap: no cross-category totals validation — age totals, race totals, and gender totals are never verified to be equal for the same filing period
+No authentication, authorization, or audit trail exists anywhere in either program
+Numeric fields are limited to 5 characters (max 99,999) — insufficient for high-volume periods such as COVID-19
+The VSAM file format is completely unportable to any cloud or modern platform
+All demographic data is stored and transmitted in plaintext with no encryption
+
+2. Business Logic Flow
+UNEMPCLM.cbl — What It Does
+UNEMPCLM is the orchestrator. It acts as the front office of the system — receiving requests, driving the workflow, and producing the human-readable formatted report. It never touches the database directly.
+Opens the output report file (OUTCLAIM)
+Reads the first command from SYSIN (the batch input stream)
+Loops through up to 200 commands per run — calls GETCLAIM, checks return code, writes report header, parses comma-delimited claim data, writes formatted data rows, writes separator line, reads next command, writes blank lines between sections
+Closes the output file and terminates
+GETCLAIM.cbl — What It Does
+GETCLAIM is the data gatekeeper. It is the only program with access to the VSAM CLAIMS file. It receives instructions from UNEMPCLM, performs the database operation, and returns the results.
+Command
+Operation
+Business Behavior
+R (Read) — 1 record
+Direct keyed lookup
+Finds the exact filing period record by its 8-character ID. Returns not-found if no match.
+R (Read) — Multiple records
+Sequential range scan
+Positions at the starting key and reads forward, collecting up to the requested number of consecutive records.
+D (Delete)
+Read then delete
+Reads the record first to capture its data, then permanently removes it. The pre-deletion data is returned to UNEMPCLM for the confirmation report.
+I (Insert)
+Write then read-back
+Writes the new record to VSAM. Immediately reads it back to confirm the insert succeeded before returning.
+U (Update)
+Read, rewrite, read-back
+Reads the existing record, overwrites it in-place with new data, then reads it back to confirm before returning.
+Report Output Modes
+Mode
+Triggered When
+Output Format
+Detail / Directory View
+1 record requested
+One field per line with labels. All five demographic dimensions listed vertically for a single filing period.
+Summary / Tabular View
+2+ records requested
+Tabular format — each row is one filing period, columns represent the selected demographic category.
+Demographic Categories
+Category
+Sub-categories
+Age
+Under 22 / 22-24 / 25-34 / 35-44 / 45-54 / 55-59 / 60-64 / 65 and over / Not Applicable
+Ethnicity
+Hispanic or Latino / Not Hispanic or Latino / Not Applicable
+Industry
+20 sectors including Wholesale Trade, Transportation & Warehouse, Construction, Finance & Insurance, Manufacturing, Agriculture, Public Administration, Utilities, Accommodation & Food Services, Information, Professional/Scientific/Tech Services, Real Estate, Other Services, Management, Educational Services, Mining, Health Care & Social Assistance, Arts/Entertainment/Recreation, Admin & Support/Waste Mgmt, Retail Trade
+Race
+White / Asian / Black or African American / American Indian or Alaskan Native / Native Hawaiian or Other Pacific Islander / Not Applicable
+Gender
+Female / Male / Not Applicable
+
+3. File Format Explanation
+VSAM CLAIMS File — Data Structure
+Property
+Detail
+File type
+VSAM KSDS (Key-Sequenced Data Set)
+Access mode
+DYNAMIC — supports direct keyed access and sequential forward reads
+Record length
+Variable, 1-260 characters per record
+Record key
+First 8 bytes of every record (the period identifier)
+Internal format
+252-byte data payload stored as comma-delimited values (CSV-like)
+Max records returned
+200 per request
+Storage file name
+CLAIMS (assigned via JCL DD name)
+Platform
+IBM z/OS mainframe only — not portable
+Record Key Format
+The 8-character record key encodes the filing period as MMDDYYYY. The day component is always 01, confirming each record represents one complete monthly filing period.
+Record ID
+Date in Record
+Decoded Meaning
+01012017
+2017-01-01T00:00:00
+January 2017 monthly filing
+02012012
+2012-02-01T00:00:00
+February 2012 monthly filing
+03012014
+2014-03-01T00:00:00
+March 2014 monthly filing
+Physical Record Layout
+Every physical VSAM record consists of two logical sections:
+Bytes 1-8: Record Key (MMDDYYYY format) — the VSAM index key embedded in the record
+Bytes 9-260: Comma-delimited claims data (up to 252 characters) containing 43 fields in fixed positional order
+Complete Field Table
+#
+Field Name
+COBOL Variable
+Max Size
+Category
+Business Meaning
+KEY
+Record ID
+UNEMP-CLAIM-KEY
+8 chars
+Identifier
+Unique filing period key in MMDDYYYY format
+1
+Date / Time
+UCR-DATE-TIME
+19 chars
+Metadata
+ISO 8601 timestamp: YYYY-MM-DDT00:00:00
+2
+Age N/A
+UCR-AGE-INA
+2 chars
+Age
+Claimants with missing or inapplicable age data
+3
+Age Under 22
+UCR-AGE-LE-22
+5 chars
+Age
+Claimants aged under 22
+4
+Age 22-24
+UCR-AGE-22-24
+5 chars
+Age
+Claimants aged 22 to 24
+5
+Age 25-34
+UCR-AGE-25-34
+5 chars
+Age
+Claimants aged 25 to 34
+6
+Age 35-44
+UCR-AGE-35-44
+5 chars
+Age
+Claimants aged 35 to 44
+7
+Age 45-54
+UCR-AGE-45-54
+5 chars
+Age
+Claimants aged 45 to 54
+8
+Age 55-59
+UCR-AGE-55-59
+5 chars
+Age
+Claimants aged 55 to 59
+9
+Age 60-64
+UCR-AGE-60-64
+5 chars
+Age
+Claimants aged 60 to 64
+10
+Age 65+
+UCR-AGE-GR-65
+5 chars
+Age
+Claimants aged 65 and over
+11
+Ethnicity N/A
+UCR-ETH-INA
+5 chars
+Ethnicity
+Claimants with missing ethnicity data
+12
+Hispanic or Latino
+UCR-ETH-HIS-LAT
+5 chars
+Ethnicity
+Claimants identifying as Hispanic or Latino
+13
+Not Hispanic or Latino
+UCR-ETH-NOT-HIS-LAT
+6 chars
+Ethnicity
+Claimants not identifying as Hispanic or Latino
+14
+Industry N/A
+UCR-IND-INA
+4 chars
+Industry
+Claimants with missing industry data
+15
+Wholesale Trade
+UCR-IND-SALE-TRADE
+4 chars
+Industry
+Claimants from wholesale trade
+16
+Transportation & Warehouse
+UCR-IND-TRANS
+5 chars
+Industry
+Claimants from transportation and warehousing
+17
+Construction
+UCR-IND-CONST
+5 chars
+Industry
+Claimants from construction
+18
+Finance & Insurance
+UCR-IND-FINAN
+4 chars
+Industry
+Claimants from finance and insurance
+19
+Manufacturing
+UCR-IND-MANUF
+5 chars
+Industry
+Claimants from manufacturing
+20
+Agriculture/Forestry/Fishing/Hunting
+UCR-IND-AGRIC
+3 chars
+Industry
+Claimants from agricultural sectors
+21
+Public Administration
+UCR-IND-PUBLI
+4 chars
+Industry
+Claimants from government and public admin
+22
+Utilities
+UCR-IND-UTILI
+3 chars
+Industry
+Claimants from utilities
+23
+Accommodation & Food Services
+UCR-IND-ACCOM
+5 chars
+Industry
+Claimants from hospitality and food service
+24
+Information
+UCR-IND-INFOM
+4 chars
+Industry
+Claimants from information and media
+25
+Professional/Scientific/Tech Services
+UCR-IND-TECH-SERV
+4 chars
+Industry
+Claimants from professional and tech services
+26
+Real Estate & Rental & Leasing
+UCR-IND-RENTAL
+4 chars
+Industry
+Claimants from real estate
+27
+Other Services (excl. Public Admin)
+UCR-IND-OTHER-SERV
+5 chars
+Industry
+Claimants from miscellaneous services
+28
+Management of Companies & Enterprises
+UCR-IND-MANAG
+4 chars
+Industry
+Claimants from corporate management
+29
+Educational Services
+UCR-IND-EDUC
+4 chars
+Industry
+Claimants from education
+30
+Mining
+UCR-IND-MINING
+3 chars
+Industry
+Claimants from mining
+31
+Health Care & Social Assistance
+UCR-IND-HEALTH
+5 chars
+Industry
+Claimants from healthcare and social services
+32
+Arts, Entertainment & Recreation
+UCR-IND-ARTS-ENTER
+5 chars
+Industry
+Claimants from arts and entertainment
+33
+Admin & Support / Waste Mgmt
+UCR-IND-ADMIN
+5 chars
+Industry
+Claimants from administrative and support services
+34
+Retail Trade
+UCR-RETAIL-TRADE
+5 chars
+Industry
+Claimants from retail trade
+35
+Race N/A
+UCR-RACE-INA
+5 chars
+Race
+Claimants with missing race data
+36
+White
+UCR-RACE-WHITE
+6 chars
+Race
+Claimants identifying as White
+37
+Asian
+UCR-RACE-ASIAN
+4 chars
+Race
+Claimants identifying as Asian
+38
+Black or African American
+UCR-RACE-BLACK
+5 chars
+Race
+Claimants identifying as Black or African American
+39
+American Indian or Alaskan Native
+UCR-RACE-NATIVE
+4 chars
+Race
+Claimants identifying as American Indian or Alaskan Native
+40
+Native Hawaiian or Other Pacific Islander
+UCR-RACE-NAT-HWAWIIAN
+4 chars
+Race
+Claimants identifying as Native Hawaiian or Pacific Islander
+41
+Gender N/A
+UCR-GEN-INA
+2 chars
+Gender
+Claimants with missing gender data
+42
+Female
+UCR-GEN-FEMALE
+6 chars
+Gender
+Claimants identifying as female
+43
+Male
+UCR-GEN-MALE
+6 chars
+Gender
+Claimants identifying as male
+Sample Record — Period 01012017 (from OUTCLAIM.txt)
+Field
+Value
+Notes
+Record Key
+01012017
+January 2017 filing period
+Date / Time
+2017-01-01T00:00:00
+ISO 8601 format
+Age Under 22
+400
+Updated from original 566
+Age 22-24
+1,000
+Updated from original 1,527
+Age 25-34
+8,000
+Updated from original 8,283
+Age 35-44
+8,412
+Unchanged
+Age 45-54
+8,700
+Unchanged
+Construction
+8,000
+Updated from original 7,046
+Accommodation & Food
+4,000
+Updated from original 3,695
+Hispanic or Latino
+1,676
+Unchanged
+Not Hispanic or Latino
+30,172
+Unchanged
+White
+26,362
+Unchanged
+Black or African American
+6,461
+Unchanged
+Female
+14,186
+Unchanged
+Male
+23,167
+Unchanged
+Note: The OUTCLAIM.txt file shows this record progressing through DELETE, INSERT, and UPDATE operations. The values above reflect the final updated state. The sequence confirms all three mutating CRUD operations and the read-back-after-write confirmation pattern work as designed.
+
+4. Identified Issues and Risks
+Top 10 Risks — Ranked by Severity
+Rank
+Risk
+Severity
+Business Impact
+Recommended Fix
+1
+No cross-category data integrity validation
+Critical
+Policy decisions and labor statistics derived from data where age totals differ from race totals are silently wrong. No mechanism detects this.
+OPA policy engine enforcing sum(age) = sum(race) = sum(gender) before every write. Nightly automated reconciliation job.
+2
+No authentication or authorization
+Critical
+Any operator with JCL access can read, modify, or delete any month of claims history. No identity check exists.
+Amazon Cognito + IAM roles. Enforced at API Gateway before Lambda runs.
+3
+No structured audit trail
+Critical
+No permanent record of who changed what data or when. FISMA and Federal Records Act compliance failure.
+Immutable audit_log table in Aurora + CloudTrail. Every write records user_id, operation, timestamp, before/after hash.
+4
+No transaction support — no rollback
+High
+A batch run failing midway leaves the database in a partially-updated state with no recovery path.
+Aurora ACID transactions. Step Functions checkpointing. Idempotency keys for safe replay.
+5
+Field size overflow — silent data corruption
+High
+PIC X(05) fields max at 99,999. COVID-19 peaks exceeded this in many states. Value 125,000 stored as 12,500 with no error raised.
+INTEGER/BIGINT columns in Aurora. Configurable maximum threshold with alerting.
+6
+Updates permanently destroy prior data
+High
+REWRITE silently overwrites the existing record. No amendment history. Cannot explain why a statistic changed.
+Temporal data model in Aurora with effective_from/effective_to columns. Never UPDATE rows — INSERT new versions.
+7
+VSAM lock-in — zero cloud portability
+High
+VSAM is IBM z/OS-only. No cloud connector exists. Full data extraction required before any migration.
+One-time VSAM export to flat files, then S3, then Aurora. Full ETL pipeline with record-level reconciliation.
+8
+No encryption at rest or in transit
+Medium-High
+Demographic claims data stored in plaintext on mainframe DASD. NIST SP 800-53 SC-28 requires encryption at rest.
+Aurora KMS encryption at creation. TLS 1.3 at API Gateway. Field-level encryption for sensitive data.
+9
+Aggregate-only model blocks fraud detection
+Medium
+No individual claimant records. Cannot detect duplicate claims or fictitious counts.
+Normalized relational model with individual claimant records, or federated query model with signed aggregate submissions.
+10
+Demographic model non-compliant with current standards
+Medium
+OMB revised SPD-15 in 2024 requiring 7 race categories. Current 5-category model cannot be used for federal reporting.
+Extensible demographic_category_ref lookup table. New categories added as data inserts, not code changes.
+Business Rules Present in Code
+Rule ID
+Rule
+COBOL Location
+Enforced?
+R01
+Only R/D/I/U/E are valid command codes
+UNEMPCLM 2000-ACCEPT-INPUT
+Yes — ABEND on violation
+R02
+Number of records must be greater than zero
+GETCLAIM 7000-NEED-GT-ZERO
+Yes — ABEND on violation
+R03/R04
+Multi-record reads must specify a valid category
+UNEMPCLM 2100-ACCEPT-READ-INPUT
+Yes — ABEND on violation
+R05
+Record must exist before it can be deleted
+GETCLAIM 3000-CLAIM-DELETE
+Yes — read before delete
+R06
+Record must exist before it can be updated
+GETCLAIM 5000-CLAIM-UPDATE
+Yes — read before rewrite
+R07
+Every insert must be confirmed by reading back
+GETCLAIM 4000-CLAIM-INSERT
+Yes — read after write
+R08
+Every update must be confirmed by reading back
+GETCLAIM 5000-CLAIM-UPDATE
+Yes — read after rewrite
+R09
+Record IDs must be unique — no duplicates
+VSAM DUPREC status 22
+Yes — VSAM enforces implicitly
+R10
+Maximum 200 commands per batch run
+UNEMPCLM 0000-MAIN-PARA
+Yes — silently stops at limit
+R11
+Maximum 200 records returned per request
+GETCLAIM OCCURS 1 TO 200
+Yes — structural memory limit
+R12
+Deleted record data must be captured before deletion
+GETCLAIM 3000-CLAIM-DELETE
+Yes — read-then-delete
+Business Rules MISSING from Code
+Rule ID
+Rule
+Risk Level
+Where It Should Be Enforced
+R15
+sum(age buckets) + age_INA must equal sum(race buckets) + race_INA must equal sum(gender buckets) + gender_INA
+Critical
+OPA policy engine — pre-write validation + nightly reconciliation job
+R16
+Record key must be valid MMDDYYYY format with day = 01
+High
+JSON Schema regex pattern in OpenAPI specification
+R17
+Claim counts must be non-negative integers
+High
+JSON Schema type and minimum constraints
+R18
+Claim counts must not exceed a realistic ceiling
+Medium
+OPA configurable threshold — alert on violation
+R19
+INA (not-applicable) counts must be included in totals and displayed in reports
+Medium
+OPA policy + report schema enforcement
+R20
+Only authorized roles may execute write operations
+Critical
+OPA + Cognito + API Gateway role-based enforcement
+
+5. AWS Modernization Plan
+Three Options at a Glance
+Dimension
+Option 1: Rehost
+Option 2: Phased Decoupling
+Option 3: Full Rewrite
+Approach
+Lift and shift — run COBOL on AWS unchanged
+Strangler Fig — replace one layer at a time
+Complete rebuild as cloud-native services
+Timeline
+~12 weeks
+~10-11 months
+~12 months
+Team Size
+2-3 people
+4-5 people
+6-7 people
+COBOL Changes
+None
+Stub only (Phase B)
+Fully replaced
+VSAM Changes
+None (emulated)
+Replaced in Phase A
+Replaced from day one
+OUTCLAIM.txt
+Identical
+Identical until Phase C
+Replaced with PDF + QuickSight
+R15 Cross-totals Fixed
+No
+Phase C
+From day one
+Access Control Fixed
+No
+Phase C
+From day one
+Audit Trail
+No
+Phase C
+From day one
+REST API Available
+No
+Phase B (~month 5)
+From day one
+Field Overflow Fixed
+No
+Phase A
+From day one
+Policy-as-Code
+No
+Phase C
+From day one
+Technical Debt Resolved
+Deferred
+Fully
+Fully
+Migration Risk
+Low
+Medium
+High
+Business Logic Regression Risk
+None
+Low-Medium
+High
+5-Year Maintainability
+Poor
+Good
+Excellent
+Option 1 — Minimal-Change Modernization (Rehost)
+Run the COBOL programs exactly as they are today, but on AWS infrastructure instead of a mainframe. The code does not change. The batch model does not change. OUTCLAIM.txt still comes out the other end. The mainframe goes away — the COBOL does not.
+Key AWS Services:
+AWS Mainframe Modernization (Micro Focus runtime on EC2) — runs compiled COBOL binaries natively
+Amazon S3 — replaces JES2 SYSIN spool and SYSOUT
+AWS Batch — replaces JCL job scheduler
+Amazon EventBridge — time-based triggers for recurring batch runs
+Amazon CloudWatch — job completion monitoring and ABEND alerting
+Micro Focus VSAM on EBS — emulates VSAM KSDS; GETCLAIM file I/O works without modification
+Pros:
+Fastest path off the mainframe — 12 weeks vs 12+ months for a rewrite
+Zero business logic risk — all 20 rules continue working exactly as today
+No data migration required — VSAM emulated in-place, decade of history preserved
+Immediate cost reduction — mainframe MIPS eliminated
+Familiar operational model for the operations team
+Cons:
+All 20 identified risks remain — field overflow, missing cross-totals validation, no access control, no audit trail
+Still dependent on COBOL developer talent pool — shrinking every year
+VSAM emulation is a vendor-specific bridge, not a strategic data platform
+No cloud-native capabilities — QuickSight, Athena, Glue cannot connect to emulated VSAM
+Technical debt is unchanged — every identified problem is deferred, not solved
+Best for: Expiring mainframe contract or hardware failure requiring immediate action. Intended as a bridge strategy, not a long-term platform.
+Option 2 — Phased Decoupling and API-Led Modernization (Recommended)
+Exploit the two natural seams in the codebase — the CALL boundary between UNEMPCLM and GETCLAIM, and GETCLAIM's exclusive ownership of VSAM — to replace the system incrementally using the Strangler Fig pattern. At no point is the entire system offline.
+Phase Structure:
+Phase A — Data Layer (Weeks 1-9): VSAM exported, Aurora schema designed and loaded, nightly sync established. Aurora is a read-only mirror — mainframe remains system of record.
+Phase B — API Layer (Weeks 10-21): Lambda functions replace GETCLAIM logic. A thin COBOL stub translates UNEMPCLM's existing CALL into an HTTP request. UNEMPCLM.cbl does not change a single line.
+Phase C — Orchestration Layer (Weeks 22-38): UNEMPCLM replaced by Step Functions. SQS replaces SYSIN. PDF and QuickSight replace OUTCLAIM.txt. OPA policy engine deployed for R15-R20.
+Phase D — Decommission (Weeks 39-44): Parallel run complete. Mainframe retired. VSAM archived to S3 Glacier.
+Key AWS Services:
+Amazon Aurora PostgreSQL — replaces VSAM; normalized schema with temporal history and integer count columns
+AWS Lambda (x7) — GetByKey, GetRange, Create, Update, Delete, Validate, GenerateReport
+Amazon API Gateway — REST API contract between orchestration and data layers
+AWS Step Functions — replaces UNEMPCLM batch loop; stateful, resumable orchestration
+Amazon SQS — replaces SYSIN 200-command limit; unlimited capacity
+Amazon Cognito — user authentication and group-based role assignment
+OPA on Lambda — policy-as-code engine for all 20 business rules
+Amazon QuickSight — interactive demographic dashboards
+Amazon S3 — JSON output, PDF reports, input archival
+Amazon EventBridge — scheduled triggers and nightly integrity checks
+Amazon CloudWatch + CloudTrail — full observability and immutable audit logging
+Amazon RDS Proxy — connection pooling between Lambda and Aurora
+Pros:
+Risk is contained to each phase — rollback at any phase boundary is straightforward
+Each phase delivers independent production value — REST API available at month 5
+UNEMPCLM never needs to be deeply understood — replaced last after data and API layers are proven
+Natural seam exploitation — the CALL boundary is exactly the right decoupling point
+Missing business rules (R15-R20) introduced in Phase C with proper policy infrastructure
+Cons:
+The COBOL stub is bespoke complexity — must handle the variable-length OCCURS 1 TO 200 Linkage Section exactly
+Two systems in production simultaneously for months — operational overhead is real
+OUTCLAIM.txt consumers see no change until Phase C (month 6+)
+The 200-command limit and ABEND pattern survive into Phase B
+Best for: Operational continuity requirement, incremental risk tolerance, organizations building AWS capability progressively.
+Option 3 — Full Cloud-Native Rewrite
+Discard both COBOL programs entirely and rebuild the unemployment claims system from scratch as a cloud-native application. The business logic, data model, and operational model are all redesigned — informed by the existing system but not constrained by its limitations.
+Pros:
+All 20 risks from the risk review are fully addressed — not deferred, not partially mitigated
+No COBOL dependency — maintainable by any developer familiar with modern languages
+Data model built correctly from the start — temporal history, geographic dimension, extensible categories
+Policy-as-code is a first-class citizen — compliance team can read and own the rules
+Full observability from day one — CloudWatch, CloudTrail, structured logs, integrity alarms
+Strategic platform for the next 20 years — extensible without fundamental redesign
+Cons:
+Highest risk of business logic regression — two decades of operational knowledge must be re-discovered from COBOL source
+Longest timeline before any production value — approximately 12 months
+Highest upfront capital investment of the three options
+All OUTCLAIM.txt consumers must change their workflow simultaneously
+Best for: Strategic platform investment, regulatory compliance requirement, long-term maintainability priority.
+Recommendation
+Option 2 (Phased Decoupling) is the recommended path, with Option 3 as the stated end state.
+The CALL boundary between UNEMPCLM and GETCLAIM is a genuinely clean seam — the Strangler Fig pattern works best when a natural interface exists, and this one does.
+The data layer (VSAM) is the highest-risk element and Option 2 addresses it first — fixing field overflow, enabling geographic dimension, and creating temporal history before any application changes.
+Phase B delivers a REST API at month 5, not month 12 — 7 months faster than Option 3.
+Option 1 does not fix anything — for a government statistical system with no access control, no audit trail, and no cross-totals validation, rehosting is not a viable 5-year strategy.
+Phase C of Option 2 and Option 3 converge architecturally — the difference is sequencing and risk distribution, not destination.
+Phased Migration Timeline
+Phase
+Name
+Duration
+Key Deliverable
+Go/No-Go Gate
+Phase 1
+Stabilize
+Weeks 1-4
+Git baseline, VSAM data export, 43-field data dictionary, business rules catalog
+VSAM baseline export verified, system inventory signed off
+Phase 2
+Decouple
+Weeks 5-12
+Aurora schema loaded, nightly sync running, CDK infrastructure deployed
+Field-level reconciliation shows zero differences over 14 consecutive sync days
+Phase 3
+Refactor
+Weeks 13-24
+Lambda functions, API Gateway, Step Functions, OPA policies, test suite
+100% unit tests pass in CI; integration test replay passes end-to-end
+Phase 4
+Validate
+Weeks 25-30
+6-week parallel run, UAT sign-off, security review, cutover rehearsal
+Six consecutive weeks of zero field-level discrepancies; UAT signed; zero open High security findings
+Phase 5
+Cut Over
+Week 31 + 90 days
+Production cutover, 90-day stabilization, mainframe decommission
+90 days with zero rollback events; final reconciliation report signed off
+
+6. AWS Architecture — Target State
+Architecture Overview
+The following diagram illustrates the target-state architecture after completion of Option 2 Phase C — equivalent to the full cloud-native architecture of Option 3. This represents the end state for both modernization paths.
+Architecture Layers
+Use a monospace Courier New font for the architecture diagram below.
+INGESTION LAYER
+==================================================================
+  HTTP Clients --> API Gateway (REST) --> Cognito JWT Authorizer
+  Batch Files  --> S3 Upload Event    --> SQS (claims-command-queue)
+  Scheduled    --> EventBridge Cron   --> AWS Batch
+ 
+POLICY LAYER  (OPA on Lambda)
+==================================================================
+  R01  Valid operations only        R15  Cross-category totals
+  R02  Record count > 0             R16  Valid MMDDYYYY period key
+  R03  Valid demographic category   R17  Non-negative claim counts
+  R18  Realistic count ceiling      R19  INA counts reported
+  R20  Role-based write access      R12  Audit entry on every write
+ 
+ORCHESTRATION LAYER  (AWS Step Functions)
+==================================================================
+  ValidateInput --> RouteOperation --> ExecuteOperation --> AuditLog
+                          |
+             +------------+------------------+
+             |            |                  |
+         GetClaim     CreateClaim       DeleteClaim
+         Lambda        Lambda             Lambda
+       (+ GetRange)  (+ UpdateClaim)
+ 
+DATA LAYER  (Amazon Aurora PostgreSQL - Multi-AZ, KMS Encrypted)
+==================================================================
+  +------------------+  +------------------------+  +------------------+
+  |  claims_period   |  | claim_demographic_     |  | claim_audit_log  |
+  |  id (UUID)       |->|  counts                |  | user_id          |
+  |  period_key      |  |  period_id (FK)        |  | operation        |
+  |  period_date     |  |  category_type         |  | period_key       |
+  |  region_code     |  |  category_code         |  | timestamp_utc    |
+  |  is_current      |  |  count (INTEGER)       |  | before_hash      |
+  |  effective_from  |  |  not_applicable        |  | after_hash       |
+  +------------------+  +------------------------+  +------------------+
+ 
+  +------------------------------------------+
+  |  demographic_category_ref                |
+  |  category_code | display_name            |
+  |  naics_code    | effective_from          |
+  |  Replaces hardcoded COBOL column positions|
+  +------------------------------------------+
+ 
+OUTPUT LAYER
+==================================================================
+  Aurora       --> Amazon QuickSight --> Interactive dashboards
+  Lambda (PDF) --> S3 pre-signed URL --> OUTCLAIM-equivalent PDF
+  S3 (Parquet) --> Amazon Athena     --> Ad-hoc SQL queries
+  EventBridge  --> SNS               --> Integrity failure alerts
+ 
+OBSERVABILITY
+==================================================================
+  All layers --> Amazon CloudWatch (metrics, dashboards, alarms)
+  All layers --> AWS CloudTrail    (immutable API-level access log)
+  Nightly    --> EventBridge --> Lambda --> Cross-totals check
+Key Architecture Decisions
+Decision
+Rationale
+Replaces
+Aurora PostgreSQL over DynamoDB
+Claims data is highly relational — period to demographic counts is a one-to-many relationship requiring joins and aggregates. SQL is the natural query language.
+VSAM KSDS
+Step Functions over pure Lambda
+The claim workflow has multiple sequential steps with state. Step Functions provides built-in retry, error handling, and execution history.
+UNEMPCLM.cbl batch loop
+OPA as a sidecar policy engine
+Business rules must be independently deployable, testable, and readable by non-developers. Embedding rules in Lambda code couples governance to deployment.
+Embedded COBOL EVALUATE statements
+SQS over direct API invocation for batch
+SQS decouples ingestion from processing, provides unlimited capacity, and enables dead-letter queue handling for failed commands.
+SYSIN 200-command hard limit
+Temporal schema (effective_from/to)
+Regulatory data requires amendment history. REWRITE in COBOL permanently destroys prior values. Temporal schema preserves every version.
+VSAM REWRITE verb
+demographic_category_ref over hardcoded columns
+NAICS codes change every 5 years. OMB categories changed in 2024. A reference table makes taxonomy changes a data operation, not a code deployment.
+Hardcoded COBOL 88-level values
+RDS Proxy between Lambda and Aurora
+Lambda can create thousands of concurrent connections. RDS Proxy pools these, preventing Aurora from being overwhelmed during peak batch processing.
+N/A (did not exist)
+Security Architecture
+Layer
+Control
+AWS Service
+Identity
+User authentication with MFA required for admin roles
+Amazon Cognito User Pools
+Authorization
+Role-based access control enforced before Lambda runs
+Cognito Groups + API Gateway Lambda Authorizer + OPA
+Encryption at rest
+All Aurora data and S3 objects encrypted with customer-managed keys
+AWS KMS (Customer Managed Key)
+Encryption in transit
+All API traffic over TLS 1.3; all Aurora connections SSL-required
+API Gateway + RDS parameter group
+Audit logging
+Every write operation produces an immutable audit record
+Aurora audit_log table + AWS CloudTrail
+Network isolation
+Aurora and Lambda in private subnets; API Gateway in public subnet only
+Amazon VPC with subnet separation
+Secrets management
+Database credentials and API keys stored encrypted, rotated automatically
+AWS Secrets Manager
+Infrastructure compliance
+All AWS resource configurations validated against policy
+AWS Config Rules
