@@ -13,7 +13,7 @@ Outputs: unemployment_claims_aws_architecture.png
 
 from diagrams import Diagram, Cluster, Edge
 from diagrams.aws.compute import Lambda
-from diagrams.aws.database import Aurora, RDSProxy
+from diagrams.aws.database import Aurora, RDS
 from diagrams.aws.integration import (
     StepFunctions, SQS, SNS, Eventbridge
 )
@@ -21,7 +21,7 @@ from diagrams.aws.network import APIGateway, VPC
 from diagrams.aws.security import Cognito, KMS, SecretsManager
 from diagrams.aws.storage import S3
 from diagrams.aws.management import Cloudwatch, Cloudtrail, Config
-from diagrams.aws.analytics import QuickSight, Athena
+from diagrams.aws.analytics import Quicksight, Athena
 from diagrams.aws.general import Client
 
 graph_attr = {
@@ -93,7 +93,7 @@ with Diagram(
 
     # --- Data Layer ---
     with Cluster("Data Layer (Private Subnet B)"):
-        rds_proxy = RDSProxy("RDS Proxy\n(Connection Pool)")
+        rds_proxy = RDS("RDS Proxy\n(Connection Pool)")
         aurora = Aurora("Aurora PostgreSQL\n(Multi-AZ, Temporal)")
 
     claims_get >> rds_proxy
@@ -107,7 +107,7 @@ with Diagram(
 
     # --- Output Layer ---
     with Cluster("Output / Reporting"):
-        quicksight = QuickSight("QuickSight\nDashboards")
+        quicksight = Quicksight("QuickSight\nDashboards")
         pdf_lambda = Lambda("PDF Generator\nLambda")
         athena = Athena("Athena\n(Ad-hoc SQL)")
         s3_reports = S3("S3 Reports\n(Parquet)")
