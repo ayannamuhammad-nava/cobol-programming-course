@@ -1,0 +1,187 @@
+
+================================================================================
+       UNEMPLOYMENT CLAIMS SYSTEM - AWS MODERNIZATION ARCHITECTURE
+              (COBOL Mainframe --> AWS Cloud-Native)
+================================================================================
+
+
+    CLIENTS / INGESTION
+    ====================
+
+    +----------------+     +----------------+     +-------------------+
+    | HTTP Clients   |     | Batch CSV/JSON |     | Scheduled Jobs    |
+    | (Web, Mobile)  |     | File Uploads   |     | (Nightly Checks)  |
+    +-------+--------+     +-------+--------+     +--------+----------+
+            |                      |                       |
+            v                      v                       v
+    +----------------+     +----------------+     +-------------------+
+    | API Gateway    |     | S3 Bucket      |     | EventBridge       |
+    | (REST)         |     | (Upload Event) |     | (Cron Rules)      |
+    +-------+--------+     +-------+--------+     +--------+----------+
+            |                      |                       |
+            v                      v                       v
+    +----------------+     +----------------+     +-------------------+
+    | Cognito JWT    |     | SQS Queue      |     | Step Functions    |
+    | Authorizer     |     | (claims-cmd-q) |     | (Orchestrator)    |
+    +-------+--------+     +----------------+     +-------------------+
+            |                      |                       |
+            +----------------------+-----------------------+
+                                   |
+                                   v
+
+    POLICY & ORCHESTRATION
+    =======================
+
+              +--------------------------------------+
+              |        AWS Step Functions             |
+              |   (Replaces UNEMPCLM.cbl batch loop) |
+              +------------------+-------------------+
+                                 |
+                  +--------------+--------------+
+                  |                             |
+                  v                             v
+        +-----------------+          +--------------------+
+        | OPA Validation  |          | Route Operation    |
+        | Lambda          |          |                    |
+        | (Policy Rules   |          |  GET  --> claims_get
+        |  R01-R20)       |          |  POST --> claims_create
+        +---------+-------+          |  PUT  --> claims_update
+                  |                  |  DEL  --> claims_delete
+                  | FAIL             |  RPT  --> claims_report
+                  v                  |  VAL  --> claims_validate
+        +-----------------+          +----------+---------+
+        | DLQ + SNS Alert |                     |
+        +-----------------+                     v
+                                     +--------------------+
+                                     | Audit Log Lambda   |
+                                     +--------------------+
+
+
+    LAMBDA FUNCTIONS (x7)
+    ======================
+
+    +-------------+ +-------------+ +-------------+ +-------------+
+    | claims_get  | | claims_     | | claims_     | | claims_     |
+    |             | | create      | | update      | | delete      |
+    +------+------+ +------+------+ +------+------+ +------+------+
+           |               |               |               |
+    +------+------+ +------+------+
+    | claims_     | | claims_     |
+    | report      | | validate    |
+    +------+------+ +------+------+
+           |               |
+           +-------+-------+-------+-------+-------+
+                   |
+                   v
+
+    DATA LAYER
+    ===========
+
+              +--------------------------------------+
+              |           RDS Proxy                   |
+              |   (Connection Pooling for Lambda)     |
+              +------------------+-------------------+
+                                 |
+                                 v
+              +--------------------------------------+
+              |     Aurora PostgreSQL (Multi-AZ)      |
+              |                                      |
+              |  +------------------+                |
+              |  | claims_period    |---1:N---+      |
+              |  +------------------+         |      |
+              |                               v      |
+              |              +-----------------------------+
+              |              | claim_demographic_counts    |
+              |              |   FK -> demographic_        |
+              |              |         category_ref        |
+              |              +-----------------------------+
+              |                                            |
+              |  +------------------+                      |
+              |  | claim_audit_log  |<---------------------+
+              |  +------------------+                      |
+              |                                            |
+              |  Temporal Model: No UPDATEs in place       |
+              |  Every version preserved with              |
+              |  effective_from / effective_to              |
+              +--------------------------------------------+
+
+
+    OUTPUT LAYER
+    =============
+
+    +-------------------+  +-------------------+  +-------------------+
+    | Amazon QuickSight |  | Lambda PDF Gen    |  | Amazon Athena     |
+    | (Dashboards)      |  | --> S3 Pre-signed |  | (Ad-hoc SQL on    |
+    | Reads from Aurora |  |    URL Download   |  |  S3 Parquet)      |
+    | Read Replicas     |  |                   |  |                   |
+    +-------------------+  +-------------------+  +-------------------+
+
+
+    OBSERVABILITY
+    ==============
+
+    +-------------------+  +-------------------+  +-------------------+
+    | CloudWatch        |  | CloudTrail        |  | SNS Alerts        |
+    | Metrics & Alarms  |  | (Immutable API    |  | (Error Rate,      |
+    | Structured JSON   |  |  Access Logs)     |  |  Integrity Fails) |
+    | Logs w/ Corr. IDs |  |                   |  |                   |
+    +-------------------+  +-------------------+  +-------------------+
+
+
+    SECURITY
+    =========
+
+    +-------------------------------------------------------------------+
+    |                                                                   |
+    |  Identity:    Cognito User Pools (MFA for admins)                |
+    |  AuthZ:       Cognito Groups + API GW Authorizer + OPA           |
+    |  Encryption:  KMS (CMK) at rest, TLS 1.3 in transit             |
+    |  Network:     VPC with public/private subnet isolation           |
+    |  Secrets:     AWS Secrets Manager (auto-rotated DB creds)        |
+    |  Audit:       claim_audit_log table + CloudTrail                 |
+    |  Compliance:  AWS Config Rules                                   |
+    |                                                                   |
+    +-------------------------------------------------------------------+
+
+
+    NETWORK LAYOUT (VPC)
+    =====================
+
+    +-------------------------------------------------------------------+
+    |  VPC                                                              |
+    |                                                                   |
+    |  +-----------------------------+                                  |
+    |  |     Public Subnet           |                                  |
+    |  |  API Gateway + Cognito      |                                  |
+    |  +-------------+---------------+                                  |
+    |                |                                                  |
+    |  +-------------v---------------+                                  |
+    |  |     Private Subnet A        |                                  |
+    |  |  Lambda Functions (x7)      |                                  |
+    |  |  Step Functions Engine       |                                  |
+    |  |  SQS Consumer               |                                  |
+    |  |  RDS Proxy                  |                                  |
+    |  +-------------+---------------+                                  |
+    |                |                                                  |
+    |  +-------------v---------------+                                  |
+    |  |     Private Subnet B        |                                  |
+    |  |  Aurora PostgreSQL Cluster   |                                  |
+    |  |  (Primary + Read Replica)   |                                  |
+    |  +-----------------------------+                                  |
+    |                                                                   |
+    +-------------------------------------------------------------------+
+
+
+================================================================================
+  COBOL (Before)                    -->   AWS (After)
+  --------------------------------        --------------------------------
+  UNEMPCLM.cbl batch loop          -->   Step Functions orchestrator
+  GETCLAIM.cbl data operations     -->   6 Lambda microservices
+  VSAM KSDS file                   -->   Aurora PostgreSQL (temporal)
+  SYSIN 200-cmd batch limit        -->   SQS unlimited message queue
+  PIC X(05) max 99,999             -->   INTEGER max 2,147,483,647
+  REWRITE (overwrites data)        -->   INSERT new version (preserves history)
+  OUTCLAIM.txt flat report         -->   QuickSight dashboards + PDF + Athena
+  No authentication                -->   Cognito JWT + role-based access
+  No audit trail                   -->   CloudTrail + audit log table
+================================================================================
