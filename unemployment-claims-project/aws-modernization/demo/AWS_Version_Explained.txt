@@ -1,0 +1,493 @@
+================================================================================
+  HOW THE AWS VERSION WORKS (Beginner Breakdown)
+  Unemployment Claims System - COBOL to AWS Modernization
+================================================================================
+
+
+WHAT DOES THIS SYSTEM DO?
+--------------------------------------------------------------------------------
+
+It stores unemployment claims data -- how many people filed for unemployment
+in a given month, broken down by age, race, gender, ethnicity, and industry.
+Government agencies use this data for reporting and policy decisions.
+
+The system lets you do 4 things (called CRUD):
+  - Create -- add a new month of data
+  - Read   -- look up data for a specific month
+  - Update -- revise numbers for an existing month
+  - Delete -- remove a month's data
+
+
+================================================================================
+  THE DATABASE (Where the data lives)
+================================================================================
+
+Think of the database as a spreadsheet with 4 tabs:
+
+
+TAB 1: claims_period -- One row per filing month
+--------------------------------------------------------------------------------
+
+  id          | period_key | period_date | region_code | is_current
+  ------------+------------+-------------+-------------+-----------
+  a1b2c3d4... | 01012017   | 2017-01-01  | null        | 1 (active)
+
+  - period_key is the month in MMDDYYYY format (always day 01)
+  - is_current tells you if this is the active version (1) or an old version (0)
+
+
+TAB 2: claim_demographic_counts -- The actual numbers, one row per category
+--------------------------------------------------------------------------------
+
+  period_id   | category_type | category_code  | count
+  ------------+---------------+----------------+------
+  a1b2c3d4... | age           | age_under_22   | 400
+  a1b2c3d4... | age           | age_22_24      | 1000
+  a1b2c3d4... | race          | race_white     | 26362
+  a1b2c3d4... | gender        | gender_female  | 14186
+
+  - period_id links back to claims_period -- this is how the database knows
+    which month these numbers belong to
+  - Instead of cramming 43 numbers into one giant row (like COBOL did),
+    each number gets its own row
+
+
+TAB 3: demographic_category_ref -- A lookup table for category labels
+--------------------------------------------------------------------------------
+
+  category_code  | category_type | display_name
+  ---------------+---------------+---------------------------
+  age_under_22   | age           | Under 22
+  race_white     | race          | White
+  gender_female  | gender        | Female
+
+  - This is like a dictionary -- when you need to display "Under 22" instead
+    of "age_under_22", you look it up here
+  - To add a new category (say a new race option), you just insert a row --
+    no code changes needed
+
+
+TAB 4: claim_audit_log -- A security camera for the database
+--------------------------------------------------------------------------------
+
+  operation | period_key | user_id        | timestamp           | before_hash | after_hash
+  ----------+------------+----------------+---------------------+-------------+-----------
+  INSERT    | 01012017   | migration-script | 2026-04-10 16:19  | null        | seed-data...
+  INSERT    | 02012017   | demo-user-001  | 2026-04-10 16:19    | null        | 083711d7cd...
+  UPDATE    | 02012017   | demo-user-001  | 2026-04-10 16:19    | 083711d7cd  | e647102c92...
+  DELETE    | 02012017   | demo-user-001  | 2026-04-10 16:19    | e647102c92  | null
+
+  - Every time anyone changes data, a row is added here
+  - It records WHO did it, WHEN, and WHAT the data looked like before and
+    after (as hashes)
+  - Nobody can edit or delete rows from this table -- it's append-only
+
+
+================================================================================
+  THE LAMBDA HANDLERS (The code that does things)
+================================================================================
+
+In AWS, a Lambda function is a small piece of code that runs when someone
+makes a request. Think of each one as a worker that does one specific job.
+Here are the 4 main ones:
+
+
+1. claims_get/handler.py -- The Reader
+--------------------------------------------------------------------------------
+
+This is what runs when someone asks "show me the data for January 2017."
+
+What it does step by step:
+  1. Receives a request like GET /claims/01012017
+  2. Queries the database: "find the claims_period row where
+     period_key = '01012017' and is_current = TRUE"
+  3. Joins that with claim_demographic_counts to get all the numbers
+  4. Returns everything as JSON
+
+It also supports range queries -- "give me all months from January onward,
+but only show me the age breakdown." That's what Step 6 of the demo showed.
+
+
+2. claims_create/handler.py -- The Creator
+--------------------------------------------------------------------------------
+
+This runs when someone submits new data for a month that doesn't exist yet.
+
+What it does step by step:
+  1. Receives a request like POST /claims with a body containing the
+     period key and all the counts
+  2. Validates the data -- this is where the business rules run:
+     - R16: Is the period key valid? (02012017 is valid, 99991234 is not)
+     - R17: Are any counts negative? (can't have -500 unemployed people)
+     - R18: Are any counts unrealistically high? (10 million ceiling)
+     - R15: Do the totals match? (total by age must equal total by race
+             must equal total by gender)
+  3. Checks for duplicates -- queries the database to see if this month
+     already exists (R09)
+  4. Inserts the data -- creates a row in claims_period and one row per
+     category in claim_demographic_counts
+  5. Read-back confirmation (R07) -- immediately reads the data back to
+     make sure it was written correctly
+  6. Audit log -- records the INSERT in claim_audit_log
+  7. Returns a success response with "readback_confirmed": true
+
+The validation code lives in services/shared/models.py:
+
+    def validate(self) -> list[str]:
+        errors = []
+
+        # R16: Valid period key format
+        if not PERIOD_KEY_PATTERN.match(self.period_key):
+            errors.append("R16: Invalid period key...")
+
+        # R17: Non-negative claim counts
+        for field_name, value in self.counts.items():
+            if value < 0:
+                errors.append("R17: Negative count...")
+
+        # R18: Realistic ceiling
+        for field_name, value in self.counts.items():
+            if value > MAX_CLAIM_COUNT:
+                errors.append("R18: Count exceeds threshold...")
+
+        # R15: Cross-category totals must match
+        # (sum of all age brackets = sum of all race brackets
+        #  = sum of all gender brackets)
+        ...
+        return errors
+
+If any rule fails, the handler returns a 400 Bad Request with the list of
+errors and DOES NOT SAVE ANYTHING.
+
+
+3. claims_update/handler.py -- The Updater (with history)
+--------------------------------------------------------------------------------
+
+This is where the biggest improvement over COBOL lives. When you update
+a record:
+
+  1. Receives PUT /claims/02012017 with revised counts
+  2. Validates the new data (same rules as create)
+  3. Finds the current record and locks it
+  4. Captures a hash of the old data (for the audit trail)
+  5. Marks the old version as inactive:
+     sets is_current = FALSE and effective_to = now
+  6. Creates a brand new row with the updated data:
+     is_current = TRUE, effective_from = now
+  7. Inserts new demographic counts linked to the new period row
+  8. Read-back confirmation (R08)
+  9. Audit log with both before_hash and after_hash
+
+So after an update, the database looks like this:
+
+  id      | period_key | is_current | effective_from      | effective_to
+  --------+------------+------------+---------------------+--------------------
+  abc123  | 02012017   | 0 (old)    | 2026-04-10 16:19:34 | 2026-04-10 16:19:34
+  def456  | 02012017   | 1 (active) | 2026-04-10 16:19:34 | null
+
+Both versions exist. The old one is just marked inactive. This is called
+temporal versioning -- you can always go back and see what the data looked
+like at any point in time.
+
+In COBOL, REWRITE destroyed the old data permanently. There was no way to
+know what the numbers were before someone changed them.
+
+
+4. claims_delete/handler.py -- The Soft Deleter
+--------------------------------------------------------------------------------
+
+"Soft delete" means the data isn't actually erased:
+
+  1. Receives DELETE /claims/02012017
+  2. Finds the current record
+  3. Captures all the data before deletion (every demographic count)
+  4. Marks it inactive: is_current = FALSE, effective_to = now
+  5. Hashes the captured data and writes it to the audit log
+  6. Returns the deleted data in the response so you can see what was removed
+
+The record is still physically in the database. A query with
+WHERE is_current = TRUE won't find it, but an auditor or administrator
+can still access it.
+
+In COBOL, DELETE UNEMP-CLAIM-FILE erased the record from the VSAM file.
+Gone forever.
+
+
+================================================================================
+  THE DATABASE CONNECTION (shared/db.py)
+================================================================================
+
+This is the "glue" between the Lambda handlers and the database:
+
+    @contextmanager
+    def get_connection(readonly=False):
+        conn = psycopg2.connect(host=DB_HOST, ...)
+        try:
+            yield conn       # let the handler use the connection
+            conn.commit()     # if everything worked, save changes
+        except Exception:
+            conn.rollback()   # if anything failed, undo ALL changes
+        finally:
+            conn.close()      # always close the connection when done
+
+Key concept: if any step fails, ALL changes are rolled back. For example,
+if the create handler inserts the period but then the read-back fails, the
+period insert is also undone. The database never ends up in a half-finished
+state. This is called a TRANSACTION.
+
+In production, this connects through RDS Proxy (a connection pooler) to
+Aurora PostgreSQL. For the demo, we swapped this with db_local.py which
+connects to local SQLite instead.
+
+
+================================================================================
+  HOW IT ALL CONNECTS IN PRODUCTION (AWS)
+================================================================================
+
+  User makes a request
+          |
+          v
+     API Gateway          <-- receives the HTTP request (like a front door)
+          |
+          v
+     Cognito JWT Auth     <-- checks: "are you logged in? are you allowed?"
+          |
+          v
+     Step Functions       <-- orchestrates the workflow
+          |                    (validate -> execute -> audit)
+          v
+     Lambda Function      <-- runs the actual Python code
+          |                    (one of the 4 handlers)
+          v
+     RDS Proxy            <-- manages database connections efficiently
+          |
+          v
+     Aurora PostgreSQL    <-- stores the data
+                               (what we simulated with SQLite)
+
+In the demo, we skipped API Gateway, Cognito, Step Functions, and RDS Proxy
+and called the Lambda handlers directly with simulated events. The business
+logic and data operations are identical -- we just bypassed the
+networking/security layers.
+
+
+================================================================================
+  COBOL vs AWS -- WHAT CHANGED AND WHY
+================================================================================
+
+
+DATA STORAGE
+--------------------------------------------------------------------------------
+
+  COBOL:
+    - VSAM KSDS file (single flat file on mainframe)
+    - 260-byte fixed record: 8-byte key + 252 bytes comma-delimited fields
+    - PIC X(05) per field = max 99,999 (overflows silently)
+    - Categories hardcoded as 88-level values in source code
+
+  AWS:
+    - Aurora PostgreSQL (relational database)
+    - 4 normalized tables with proper INTEGER columns
+    - INTEGER = max 2,147,483,647
+    - Categories stored in reference table -- add new ones as data, not code
+
+
+DELETE BEHAVIOR
+--------------------------------------------------------------------------------
+
+  COBOL:
+    - DELETE UNEMP-CLAIM-FILE -- record permanently destroyed
+    - Cannot recover
+    - No audit trail -- just DISPLAY 'RECORD IS DELETED' to console
+
+  AWS:
+    - Soft delete: is_current = FALSE, record stays in database
+    - Fully recoverable
+    - Audit log with user ID, timestamp, SHA-256 hash of deleted data
+
+
+UPDATE BEHAVIOR
+--------------------------------------------------------------------------------
+
+  COBOL:
+    - REWRITE UNEMP-CLAIM-REC -- overwrites old data in place
+    - Previous values lost forever
+
+  AWS:
+    - Creates a new version; old version preserved with effective_to timestamp
+    - Full temporal versioning -- see every version that ever existed
+
+
+VALIDATION / BUSINESS RULES
+--------------------------------------------------------------------------------
+
+  COBOL:
+    - Basic VSAM status checks (duplicate key '22', not found '23')
+    - No cross-category validation
+    - No format validation on period key
+    - No negative count checks
+    - No access control
+
+  AWS:
+    - 12 original rules + 6 new ones (R15-R20)
+    - R15: Cross-category totals must match (age = race = gender)
+    - R16: Valid MMDDYYYY period key with DD=01
+    - R17: Non-negative claim counts enforced
+    - R18: Realistic count ceiling (10 million) with alerting
+    - R20: Cognito JWT auth with role-based permissions
+
+
+AUDIT TRAIL
+--------------------------------------------------------------------------------
+
+  COBOL:
+    - DISPLAY statements to SYSOUT (transient console output)
+    - Just "RECORD IS DELETED/INSERTED/UPDATED" + the key
+
+  AWS:
+    - claim_audit_log table -- immutable, permanent record
+    - Records user ID, operation, timestamp, before/after SHA-256 hashes
+    - Designed for FISMA and Federal Records Act compliance
+
+
+READ / QUERY CAPABILITIES
+--------------------------------------------------------------------------------
+
+  COBOL:
+    - Single record: READ CLAIMS-FILE KEY IS UNEMP-CLAIM-KEY
+    - Range scan: START + READ NEXT loop, max 200 records
+    - Must read entire record, then format by category in COBOL
+    - Output: fixed-width text file (OUTCLAIM.txt)
+
+  AWS:
+    - Single record: GET /claims/{period_key}
+    - Range query with ?start=&count=&category=, max 1,000 records
+    - Filter by demographic category at the database level
+    - Output: JSON API responses, PDF reports, QuickSight dashboards
+
+
+ARCHITECTURE
+--------------------------------------------------------------------------------
+
+  COBOL:
+    - 2 programs: UNEMPCLM.cbl (orchestrator) + GETCLAIM.cbl (data layer)
+    - Tightly coupled -- UNEMPCLM calls GETCLAIM via CALL with shared memory
+    - JCL batch job reads SYSIN cards sequentially, hard limit of 200 commands
+    - Single mainframe thread
+    - 9999-ABEND-PARA aborts the entire program on error
+
+  AWS:
+    - 6 Lambda microservices (get, create, update, delete, validate, report)
+    - Loosely coupled -- each Lambda is independent, connected via API Gateway
+    - SQS queue with unlimited messages, processed in parallel
+    - Lambda auto-scales to handle concurrent requests
+    - Each operation fails independently; Step Functions retry with backoff
+
+
+REPORT GENERATION
+--------------------------------------------------------------------------------
+
+  COBOL:
+    - Hardcoded fixed-width text with PIC X(582) output records
+    - Separate headers per category (HEADER-1-SEQ-BY-AGE, etc.)
+    - Written to OUTCLAIM.txt sequential file on mainframe
+
+  AWS:
+    - JSON or text format, generated on demand
+    - Uploaded to S3 with pre-signed download URL
+    - Amazon QuickSight dashboards connected to Aurora read replica
+
+
+================================================================================
+  WHY THIS MATTERS (Risk Summary)
+================================================================================
+
+  Risk in COBOL                              | How AWS fixes it
+  -------------------------------------------+-----------------------------------
+  Someone updates a record -- old data gone   | Every version is preserved with
+  forever                                     | timestamps
+                                              |
+  Someone deletes a record -- no trace it     | Soft delete keeps the data;
+  existed                                     | audit log records who/when
+                                              |
+  A count exceeds 99,999 and silently         | INTEGER fields hold up to
+  overflows                                   | 2.1 billion
+                                              |
+  No way to know who changed what             | Audit log with user IDs and
+                                              | cryptographic hashes
+                                              |
+  Age totals don't match gender totals --     | R15 validation catches mismatches
+  nobody notices                              | before data is saved
+                                              |
+  Only 200 records can be processed in one    | SQS queue handles unlimited
+  batch                                       | messages
+
+
+================================================================================
+  RUNNING THE DEMO
+================================================================================
+
+To run the demo locally (no AWS account, no Docker, no installs needed):
+
+    cd aws-modernization/demo
+    python3 demo.py
+
+The demo walks through 9 steps:
+
+    Step 1: READ   - Retrieved seed data (from original COBOL OUTCLAIM.txt)
+    Step 2: CREATE - Inserted new claim with full validation (R07, R09, R12, R15-R18)
+    Step 3: READ   - Verified created record
+    Step 4: UPDATE - Revised claim with temporal versioning (old version preserved)
+    Step 5: READ   - Verified updated record
+    Step 6: RANGE  - Listed all periods filtered by demographic category
+    Step 7: DELETE - Soft-deleted claim (data preserved for audit)
+    Step 8: READ   - Confirmed deletion (404 response)
+    Step 9: AUDIT  - Reviewed immutable audit trail (new capability vs COBOL)
+
+To explore the database after the demo:
+
+    sqlite3 aws-modernization/demo/claims_demo.db
+
+Useful queries:
+
+    .tables                              -- list all tables
+    SELECT COUNT(*) FROM claims_period;  -- count records
+    SELECT * FROM claim_audit_log;       -- see audit trail
+    SELECT * FROM v_cross_category_totals;  -- check data integrity
+
+
+================================================================================
+  FILE REFERENCE
+================================================================================
+
+  Original COBOL source:
+    src/cbl/unemplclm.cbl    -- Main orchestrator program
+    src/cbl/getclaim.cbl     -- VSAM data access layer (CRUD operations)
+
+  AWS modernized code:
+    aws-modernization/services/claims_get/handler.py      -- Read operations
+    aws-modernization/services/claims_create/handler.py   -- Create with validation
+    aws-modernization/services/claims_update/handler.py   -- Update with versioning
+    aws-modernization/services/claims_delete/handler.py   -- Soft delete
+    aws-modernization/services/claims_validate/handler.py -- OPA policy validation
+    aws-modernization/services/claims_report/handler.py   -- Report generation
+    aws-modernization/services/shared/db.py               -- Database connection
+    aws-modernization/services/shared/models.py           -- Data models + rules
+
+  Database:
+    aws-modernization/data/schema.sql    -- Table definitions
+    aws-modernization/data/seed.sql      -- Sample data from OUTCLAIM.txt
+
+  Infrastructure:
+    aws-modernization/infrastructure/    -- Terraform IaC for all AWS resources
+    aws-modernization/architecture.md    -- Architecture design document
+
+  Demo:
+    aws-modernization/demo/demo.py             -- Main demo script
+    aws-modernization/demo/db_local.py         -- Local SQLite DB connection
+    aws-modernization/demo/setup_db.py         -- Database setup script
+    aws-modernization/demo/DEMO_INSTRUCTIONS.md -- Step-by-step setup guide
+
+================================================================================
+  END OF DOCUMENT
+================================================================================

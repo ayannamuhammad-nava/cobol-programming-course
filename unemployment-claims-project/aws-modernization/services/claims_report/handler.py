@@ -6,6 +6,7 @@ Generates both:
   - JSON summary (for QuickSight / programmatic consumption)
   - Text report (backward-compatible OUTCLAIM.txt equivalent)
 """
+from __future__ import annotations
 
 import io
 import json

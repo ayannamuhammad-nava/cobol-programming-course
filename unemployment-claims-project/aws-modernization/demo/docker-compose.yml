@@ -1,0 +1,17 @@
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: claims-demo-db
+    environment:
+      POSTGRES_USER: claims_admin
+      POSTGRES_PASSWORD: demo_password
+      POSTGRES_DB: unemployment_claims
+    ports:
+      - "5432:5432"
+    volumes:
+      - claims_data:/var/lib/postgresql/data
+
+volumes:
+  claims_data:

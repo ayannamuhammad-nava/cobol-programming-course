@@ -6,6 +6,7 @@ COBOL equivalent:
   - Single record: Direct keyed VSAM READ by 8-char period key
   - Range scan: START at key, READ NEXT up to N records sequentially
 """
+from __future__ import annotations
 
 import json
 import logging
